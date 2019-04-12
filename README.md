@@ -16,5 +16,5 @@ The list of paths may be single files or directories. If directories all .go fil
 Typical CLI Invocation:
 
 ```sh
-goimports-rewrite -r github.com/foo/bar:github.com/bar/foo -r code.google.com/this/is/gone:github.com/new/location .
+goimport-rewrite -r github.com/foo/bar:github.com/bar/foo -r code.google.com/this/is/gone:github.com/new/location .
 ```
