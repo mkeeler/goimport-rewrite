@@ -1,4 +1,4 @@
-# goimports-rewrite
+# goimport-rewrite
 Tool to rewrite some go import paths. The majority of this code was ripped from the `go fix` tool with some modifications then to do arbitrary import rewriting and not any of the other fix code.
 
 ## Usage
