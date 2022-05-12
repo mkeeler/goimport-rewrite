@@ -1,3 +1,3 @@
-module goimport-rewrite
+module github.com/mkeeler/goimport-rewrite
 
-go 1.12
+go 1.17
