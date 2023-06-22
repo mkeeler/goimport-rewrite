@@ -1,24 +1,14 @@
 package main
 
 import (
-	"bytes"
 	"flag"
 	"fmt"
-	"go/ast"
-	"go/format"
-	"go/parser"
-	"go/scanner"
-	"go/token"
 	"io/ioutil"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
-)
 
-var (
-	fset     = token.NewFileSet()
-	exitCode = 0
+	"github.com/mkeeler/goimport-rewrite/pkg/rewrite"
 )
 
 type MapVar map[string]string
@@ -38,41 +28,6 @@ func (m MapVar) Set(input string) error {
 	return nil
 }
 
-const parserMode = parser.ParseComments
-
-var rewrites map[string]string = make(map[string]string)
-
-// Taken from: https://github.com/golang/go/blob/3813edf26edb78620632dc9c7d66096e5b2b5019/src/cmd/fix/main.go#L105-114
-func gofmtFile(f *ast.File) ([]byte, error) {
-	var buf bytes.Buffer
-	if err := format.Node(&buf, fset, f); err != nil {
-		return nil, err
-	}
-	return buf.Bytes(), nil
-}
-
-// Taken from: https://github.com/golang/go/blob/3813edf26edb78620632dc9c7d66096e5b2b5019/src/cmd/fix/main.go#L216-L219
-func report(err error) {
-	scanner.PrintError(os.Stderr, err)
-	exitCode = 2
-}
-
-// Taken from: https://github.com/golang/go/blob/3813edf26edb78620632dc9c7d66096e5b2b5019/src/cmd/fix/main.go#L221-L223
-func walkDir(path string) {
-	filepath.Walk(path, visitFile)
-}
-
-// Taken from: https://github.com/golang/go/blob/3813edf26edb78620632dc9c7d66096e5b2b5019/src/cmd/fix/main.go#L225-L232
-func visitFile(path string, f os.FileInfo, err error) error {
-	if err == nil && isGoFile(f) {
-		err = processFile(path, false)
-	}
-	if err != nil {
-		report(err)
-	}
-	return nil
-}
-
 // Taken from: https://github.com/golang/go/blob/3813edf26edb78620632dc9c7d66096e5b2b5019/src/cmd/fix/main.go#L235-L239
 func isGoFile(f os.FileInfo) bool {
 	// ignore non-Go files
@@ -80,34 +35,68 @@ func isGoFile(f os.FileInfo) bool {
 	return !f.IsDir() && !strings.HasPrefix(name, ".") && strings.HasSuffix(name, ".go")
 }
 
-// Taken from: https://github.com/golang/go/blob/3813edf26edb78620632dc9c7d66096e5b2b5019/src/cmd/fix/fix.go#L302-L310
-// importPath returns the unquoted import path of s,
-// or "" if the path is not properly quoted.
-func importPath(s *ast.ImportSpec) string {
-	t, err := strconv.Unquote(s.Path.Value)
-	if err == nil {
-		return t
-	}
-	return ""
+func usage() {
+	fmt.Fprintf(os.Stderr, "usage: goimport-rewrite -r <import path>:<new import path> [-r <import path>:<new import path>] [path ...]\n\n")
+	fmt.Fprintf(os.Stderr, "The list of paths may be single files or directories. If directories all .go files within that directory will be processed\n\n")
+	flag.PrintDefaults()
+	fmt.Fprintf(os.Stderr, "\n")
+	os.Exit(2)
 }
 
-// Take from: https://github.com/golang/go/blob/3813edf26edb78620632dc9c7d66096e5b2b5019/src/cmd/fix/fix.go#L697-L709
-// Then modified to do multiple rewrites based on a map
-// rewriteImport rewrites any import of path oldPath to path newPath.
-func rewriteImports(f *ast.File, rewrites map[string]string) (rewrote bool) {
-	for _, imp := range f.Imports {
-		if newPath, needsRewriting := rewrites[importPath(imp)]; needsRewriting {
-			rewrote = true
-			// record old End, because the default is to compute
-			// it using the length of imp.Path.Value.
-			imp.EndPos = imp.End()
-			imp.Path.Value = strconv.Quote(newPath)
+func main() {
+	prefix := false
+	rewrites := make(map[string]string)
+
+	flag.Var(MapVar(rewrites), "r", "Import to rewrite. Expected format is '<old path>:<new path>'.")
+	flag.BoolVar(&prefix, "prefix", false, "Perform prefix replacements instead of exact matching/replacement")
+	flag.Usage = usage
+	flag.Parse()
+
+	if len(rewrites) < 1 {
+		fmt.Fprintf(os.Stderr, "At least one import rewrite is required\n")
+		os.Exit(1)
+	}
+
+	var processor rewriteProcessor
+	if prefix {
+		processor.rewriter = rewrite.NewPrefixRewriter(rewrites)
+	} else {
+		processor.rewriter = rewrite.NewExactRewriter(rewrites)
+	}
+
+	if flag.NArg() == 0 {
+		if err := processor.processFile("standard input", true); err != nil {
+			fmt.Fprintf(os.Stderr, "error processing standard input: %v\n", err)
+			os.Exit(2)
+		}
+		os.Exit(0)
+	}
+
+	for i := 0; i < flag.NArg(); i++ {
+		path := flag.Arg(i)
+
+		dir, err := os.Stat(path)
+		if err == nil {
+			if dir.IsDir() {
+				err = processor.walkDir(path)
+			} else {
+				err = processor.processFile(path, false)
+			}
+		}
+
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "encountered a fatal error: %v\n", err)
+			os.Exit(2)
 		}
 	}
-	return
+	os.Exit(0)
 }
 
-func processFile(filename string, useStdin bool) error {
+type rewriteProcessor struct {
+	rewriter rewrite.ImportRewriter
+}
+
+func (p *rewriteProcessor) processFile(filename string, useStdin bool) error {
 	var f *os.File
 	var err error
 
@@ -126,69 +115,35 @@ func processFile(filename string, useStdin bool) error {
 		return err
 	}
 
-	file, err := parser.ParseFile(fset, filename, src, parserMode)
+	rewritten, output, err := p.rewriter.RewriteImports(filename, string(src))
 	if err != nil {
 		return err
 	}
 
-	// Rewrite the imports
-	if !rewriteImports(file, rewrites) {
+	if !rewritten {
 		return nil
 	}
+
 	fmt.Fprintf(os.Stderr, "%s: rewrote imports\n", filename)
 
-	// format the source
-	newSrc, err := gofmtFile(file)
-	if err != nil {
-		return err
-	}
-
 	if useStdin {
-		os.Stdout.Write(newSrc)
+		os.Stdout.Write([]byte(output))
 		return nil
 	}
 
-	return ioutil.WriteFile(f.Name(), newSrc, 0)
+	return ioutil.WriteFile(filename, []byte(output), 0)
 }
 
-func usage() {
-	fmt.Fprintf(os.Stderr, "usage: goimport-rewrite -r <import path>:<new import path> [-r <import path>:<new import path>] [path ...]\n\n")
-	fmt.Fprintf(os.Stderr, "The list of paths may be single files or directories. If directories all .go files within that directory will be processed\n\n")
-	flag.PrintDefaults()
-	fmt.Fprintf(os.Stderr, "\n")
-	os.Exit(2)
+func (p *rewriteProcessor) walkDir(path string) error {
+	return filepath.Walk(path, p.visitFile)
 }
 
-func main() {
-	flag.Var(MapVar(rewrites), "r", "Import to rewrite. Expected format is '<old path>:<new path>'.")
-	flag.Usage = usage
-	flag.Parse()
-
-	if len(rewrites) < 1 {
-		report(fmt.Errorf("At least one import rewrite is required"))
-		os.Exit(1)
+func (p *rewriteProcessor) visitFile(path string, f os.FileInfo, err error) error {
+	if err == nil && isGoFile(f) {
+		err = p.processFile(path, false)
 	}
-
-	if flag.NArg() == 0 {
-		if err := processFile("standard input", true); err != nil {
-			report(err)
-		}
-		os.Exit(exitCode)
+	if err != nil {
+		return err
 	}
-
-	for i := 0; i < flag.NArg(); i++ {
-		path := flag.Arg(i)
-		switch dir, err := os.Stat(path); {
-		case err != nil:
-			report(err)
-		case dir.IsDir():
-			walkDir(path)
-		default:
-			if err := processFile(path, false); err != nil {
-				report(err)
-			}
-		}
-	}
-
-	os.Exit(exitCode)
+	return nil
 }
